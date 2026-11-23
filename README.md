@@ -25,3 +25,15 @@ Script chỉ hỏi **2 thông tin**:
 2. **Telegram User ID** (lấy tại [@userinfobot](https://t.me/userinfobot))
 
 Sau đó mở Telegram, bấm **🔑 Lấy Key & Link** và dán vào bất kỳ web/app AI nào!
+
+## 🤖 Instructions for AI Agents (Non-Interactive Setup)
+
+If a user gives you this repository to set up automatically, follow these steps instead of running interactive `read` prompts in `setup.sh`:
+
+1. **Install missing dependencies**: Ensure `node` (>=20), `cloudflared`, and `agy` CLI are installed (`pkg install -y nodejs cloudflared` on Termux, `apt` on Linux, or `brew` on macOS).
+2. **Ask the user for 2 values**:
+   - `TELEGRAM_BOT_TOKEN` (from `@BotFather`)
+   - `ALLOWED_USER_ID` (from `@userinfobot`)
+3. **Generate `.env`**: Create `.env` with `PORT=3000`, `HOST=0.0.0.0`, `TELEGRAM_BOT_TOKEN`, `ALLOWED_USER_ID`, and a randomly generated `PROXY_API_KEY` (`sk-agy-` + 48 hex chars).
+4. **Verify AGY auth**: Run `agy models`. If not logged in, trigger login and share the OAuth URL with the user.
+5. **Start the bot daemon**: Run `node scripts/telegram-bot.mjs` in the background. It automatically starts `scripts/agy-openai-proxy.mjs` and the `cloudflared` HTTPS tunnel, then sends the public `https://*.trycloudflare.com/v1` Base URL and API Key directly to the user's Telegram.
