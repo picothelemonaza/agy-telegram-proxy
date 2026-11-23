@@ -3,6 +3,13 @@ import { promisify } from 'node:util';
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  loadKeys,
+  createApiKey,
+  deleteApiKey,
+  resetApiKeyUsage,
+  getKeyHistory,
+} from './key-store.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -67,6 +74,10 @@ const MENU_KEYBOARD = {
     [
       { text: '🔑 Lấy Key & Link', callback_data: 'get_api_key' },
       { text: '🤖 Danh Sách Model', callback_data: 'models_usage' },
+    ],
+    [
+      { text: '🗝️ Quản Lý Key', callback_data: 'manage_keys' },
+      { text: '📜 Lịch Sử I/O', callback_data: 'history_master' },
     ],
     [
       { text: '⚡ Xem Hạn Mức (5H/1W)', callback_data: 'quota' },
@@ -319,7 +330,49 @@ async function getModelsAndUsage() {
   return lines.join('\n');
 }
 
-async function handleAction(chatId, action) {
+function formatKeysList() {
+  const keys = loadKeys(PROXY_API_KEY);
+  const lines = ['🗝️ *Danh Sách API Key*', ''];
+  for (const k of keys) {
+    const limitStr = k.tokenLimit > 0 ? k.tokenLimit.toLocaleString() : '∞';
+    const pct = k.tokenLimit > 0 ? ` (${Math.min(100, Math.round((k.tokensUsed / k.tokenLimit) * 100))}%)` : '';
+    lines.push(
+      `• *${k.name}* — ${k.tokensUsed.toLocaleString()} / ${limitStr} tokens${pct} (${k.requests || 0} reqs)`,
+      `  \`${k.key}\``
+    );
+  }
+  lines.push(
+    '',
+    '📌 *Lệnh nhanh:*',
+    '• `/newkey <tên> <giới_hạn>` — Tạo key (vd: `/newkey banA 50000`, `0` = không giới hạn)',
+    '• `/history <tên>` — Xem lịch sử Input/Output của key',
+    '• `/resetkey <tên>` — Reset token về 0',
+    '• `/delkey <tên>` — Xóa key'
+  );
+  return lines.join('\n');
+}
+
+function formatKeyHistory(name = 'master') {
+  const items = getKeyHistory(name, 5);
+  if (items.length === 0) {
+    return `📜 Chưa có lịch sử Input/Output nào cho key *${name}*.\n_(Dùng \`/history <tên_key>\` để xem key khác)_`;
+  }
+  const lines = [`📜 *Lịch Sử Input/Output: ${name}* (5 gần nhất)`, ''];
+  for (const item of items) {
+    const t = item.time.replace('T', ' ').slice(5, 19);
+    const inp = item.input.replace(/`/g, "'").slice(0, 220);
+    const out = item.output.replace(/`/g, "'").slice(0, 300);
+    lines.push(
+      `🕒 \`${t}\` | *${item.model}* | ${item.inTokens}→${item.outTokens} tok`,
+      `📥 *In:* ${inp}${item.input.length > 220 ? '…' : ''}`,
+      `📤 *Out:* ${out}${item.output.length > 300 ? '…' : ''}`,
+      '───'
+    );
+  }
+  return lines.join('\n').slice(0, 3900);
+}
+
+async function handleAction(chatId, action, args = []) {
   let reply = '';
   switch (action) {
     case 'start_proxy':
@@ -351,6 +404,47 @@ async function handleAction(chatId, action) {
     case 'quota':
       reply = await getQuotaReport();
       break;
+    case 'manage_keys':
+      reply = formatKeysList();
+      break;
+    case 'history_master':
+      reply = formatKeyHistory(args[0] || 'master');
+      break;
+    case 'newkey': {
+      const [name, limit] = args;
+      if (!name) {
+        reply = '❌ Cú pháp: `/newkey <tên> <giới_hạn_token>`\nVí dụ: `/newkey banA 50000` (hoặc `0` = không giới hạn)';
+      } else {
+        try {
+          const entry = createApiKey(name, limit ?? 0, PROXY_API_KEY);
+          const limitStr = entry.tokenLimit > 0 ? `${entry.tokenLimit.toLocaleString()} tokens` : 'Không giới hạn';
+          reply = `✅ *Đã tạo key mới!*\n\n• Tên: *${entry.name}*\n• Giới hạn: *${limitStr}*\n• API Key:\n\`${entry.key}\`\n• Base URL:\n\`${publicUrl ? `${publicUrl}/v1` : `${BASE_URL}/v1`}\``;
+        } catch (err) {
+          reply = `❌ ${err.message}`;
+        }
+      }
+      break;
+    }
+    case 'delkey': {
+      const [name] = args;
+      if (!name) {
+        reply = '❌ Cú pháp: `/delkey <tên_key>`';
+      } else {
+        const ok = deleteApiKey(name, PROXY_API_KEY);
+        reply = ok ? `🗑️ Đã xóa key *${name}*.` : `❌ Không tìm thấy key *${name}*.`;
+      }
+      break;
+    }
+    case 'resetkey': {
+      const [name] = args;
+      if (!name) {
+        reply = '❌ Cú pháp: `/resetkey <tên_key>`';
+      } else {
+        const entry = resetApiKeyUsage(name, PROXY_API_KEY);
+        reply = entry ? `🔄 Đã reset số token của *${entry.name}* về 0.` : `❌ Không tìm thấy key *${name}*.`;
+      }
+      break;
+    }
     default:
       reply = [
         '👋 *Bảng Điều Khiển AI Proxy*',
@@ -402,11 +496,19 @@ async function poll() {
             await tg('answerCallbackQuery', { callback_query_id: cb.id });
             await handleAction(chatId, cb.data);
           } else if (msg?.text) {
-            const cmd = msg.text.trim().split(/\s+/)[0].replace(/^\//, '').split('@')[0];
+            const parts = msg.text.trim().split(/\s+/);
+            const cmd = parts[0].replace(/^\//, '').split('@')[0].toLowerCase();
+            const args = parts.slice(1);
             if (['start', 'menu', 'help'].includes(cmd)) {
               await handleAction(chatId, 'menu');
             } else if (['apikey', 'key', 'get_api_key'].includes(cmd)) {
               await handleAction(chatId, 'get_api_key');
+            } else if (['keys', 'manage_keys'].includes(cmd)) {
+              await handleAction(chatId, 'manage_keys');
+            } else if (['newkey', 'delkey', 'resetkey'].includes(cmd)) {
+              await handleAction(chatId, cmd, args);
+            } else if (['history', 'hist'].includes(cmd)) {
+              await handleAction(chatId, 'history_master', args);
             } else if (['model', 'models', 'models_usage'].includes(cmd)) {
               await handleAction(chatId, 'models_usage');
             } else if (['usage', 'quota'].includes(cmd)) {

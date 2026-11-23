@@ -4,6 +4,7 @@ import { promisify } from 'node:util';
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { findKeyBySecret, recordKeyUsageAndHistory, estimateTokens } from './key-store.mjs';
 
 const execFileAsync = promisify(execFile);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -27,12 +28,13 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 const HOST = process.env.HOST || '0.0.0.0';
 const PROXY_API_KEY = process.env.PROXY_API_KEY || '';
 
-function isAuthorized(req) {
-  if (!PROXY_API_KEY) return true;
+function getAuthKeyEntry(req) {
   const auth = req.headers['authorization'] || '';
   const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
   const xKey = (req.headers['x-api-key'] || '').toString().trim();
-  return bearer === PROXY_API_KEY || xKey === PROXY_API_KEY;
+  const secret = bearer || xKey;
+  if (!secret) return null;
+  return findKeyBySecret(secret, PROXY_API_KEY);
 }
 
 // Metrics store (last 24h)
@@ -174,12 +176,22 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, { stats: getStats(), recentRequests: metrics.slice(-50).reverse() });
   }
 
-  // Require API key for all OpenAI API endpoints
-  if (!isAuthorized(req)) {
+  // Require valid API key for all OpenAI API endpoints
+  const keyEntry = getAuthKeyEntry(req);
+  if (!keyEntry || !keyEntry.enabled) {
     return sendJson(res, 401, {
       error: {
-        message: 'Invalid or missing API key. Provide Authorization: Bearer <API_KEY>.',
+        message: 'Invalid or disabled API key. Provide Authorization: Bearer <API_KEY>.',
         type: 'authentication_error',
+      },
+    });
+  }
+
+  if (keyEntry.tokenLimit > 0 && keyEntry.tokensUsed >= keyEntry.tokenLimit) {
+    return sendJson(res, 429, {
+      error: {
+        message: `Token limit exceeded for key "${keyEntry.name}" (${keyEntry.tokensUsed}/${keyEntry.tokenLimit}).`,
+        type: 'rate_limit_error',
       },
     });
   }
@@ -221,9 +233,11 @@ const server = http.createServer(async (req, res) => {
 
       const child = spawn('agy', args, { stdio: ['ignore', 'pipe', 'pipe'] });
       let stderrBuf = '';
+      let outputBuf = '';
 
       child.stdout.on('data', (chunk) => {
         const text = chunk.toString();
+        outputBuf += text;
         const payload = {
           id: chatId,
           object: 'chat.completion.chunk',
@@ -240,7 +254,16 @@ const server = http.createServer(async (req, res) => {
 
       child.on('close', (code) => {
         const duration = Date.now() - startTime;
-        recordMetric(model, duration, code === 0 ? 'success' : 'error');
+        const status = code === 0 ? 'success' : 'error';
+        recordMetric(model, duration, status);
+        recordKeyUsageAndHistory({
+          keyName: keyEntry.name,
+          model,
+          input: prompt,
+          output: outputBuf || stderrBuf,
+          status,
+          defaultMasterKey: PROXY_API_KEY,
+        });
         const endPayload = {
           id: chatId,
           object: 'chat.completion.chunk',
@@ -264,6 +287,14 @@ const server = http.createServer(async (req, res) => {
       const { stdout } = await execFileAsync('agy', args, { timeout: 120000, maxBuffer: 10 * 1024 * 1024 });
       const content = stdout.trim();
       recordMetric(model, Date.now() - startTime, 'success');
+      const rec = recordKeyUsageAndHistory({
+        keyName: keyEntry.name,
+        model,
+        input: prompt,
+        output: content,
+        status: 'success',
+        defaultMasterKey: PROXY_API_KEY,
+      });
       return sendJson(res, 200, {
         id: chatId,
         object: 'chat.completion',
@@ -276,13 +307,26 @@ const server = http.createServer(async (req, res) => {
             finish_reason: 'stop',
           },
         ],
-        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        usage: {
+          prompt_tokens: rec.inTokens,
+          completion_tokens: rec.outTokens,
+          total_tokens: rec.totalTokens,
+        },
       });
     } catch (err) {
+      const errMsg = err.stderr?.trim() || err.message || 'agy execution failed';
       recordMetric(model, Date.now() - startTime, 'error');
+      recordKeyUsageAndHistory({
+        keyName: keyEntry.name,
+        model,
+        input: prompt,
+        output: errMsg,
+        status: 'error',
+        defaultMasterKey: PROXY_API_KEY,
+      });
       return sendJson(res, 500, {
         error: {
-          message: err.stderr?.trim() || err.message || 'agy execution failed',
+          message: errMsg,
           type: 'api_error',
         },
       });
