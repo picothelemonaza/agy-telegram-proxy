@@ -1,0 +1,15 @@
+{
+  "name": "agy-telegram-proxy",
+  "version": "1.0.0",
+  "description": "1-click OpenAI-compatible proxy for Antigravity (AGY) with Cloudflare HTTPS Tunnel and Telegram control bot",
+  "type": "module",
+  "scripts": {
+    "setup": "bash setup.sh",
+    "start": "node scripts/telegram-bot.mjs",
+    "proxy": "node scripts/agy-openai-proxy.mjs"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "license": "MIT"
+}
